@@ -43,6 +43,32 @@ class ApiError extends Error {
 }
 const badRequest = (msg, code = 'invalid') => { throw new ApiError(400, code, msg) }
 const conflict = (msg, code = 'conflict') => { throw new ApiError(409, code, msg) }
+const forbidden = (msg, code = 'forbidden') => { throw new ApiError(403, code, msg) }
+
+// ---------------- 角色权限与审批链 ----------------
+const ROLES = { recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理' }
+// 审批链：按角色逐级审批，任一节点可「退回」给发起人修改后重新提交
+const APPROVAL_TYPES = {
+  stage_advance: { label: '候选人推进', chain: ['hiring_manager'] },
+  interview_conclusion: { label: '面试结论', chain: ['recruiter'] },
+  offer_issue: { label: 'Offer 发放', chain: ['hiring_manager', 'recruiter'] }
+}
+// 各审批类型允许的发起角色
+const APPROVAL_REQUESTER = {
+  stage_advance: ['recruiter'],
+  interview_conclusion: ['interviewer', 'recruiter'],
+  offer_issue: ['recruiter']
+}
+const APPROVAL_STATUS_LABEL = { pending: '审批中', approved: '已通过', returned: '已退回', cancelled: '已取消' }
+const APPROVAL_ACTION_LABEL = { submit: '提交', resubmit: '重新提交', approve: '批准', return: '退回', cancel: '取消' }
+
+// 服务端强制鉴权：请求必须携带合法角色，且在允许列表内
+function requireRole(b, roles) {
+  const role = b?.role
+  if (!ROLES[role]) forbidden('缺少合法操作角色，请先在右上角选择身份', 'role_required')
+  if (!roles.includes(role)) forbidden(`「${ROLES[role]}」无权执行此操作，需要：${roles.map(r => ROLES[r]).join('/')}`, 'role_denied')
+  return role
+}
 
 // 乐观锁：阶段协同类操作必须携带读取时的 version；并发/重复点击导致版本错位时拒绝
 function checkVersion(app, expected) {
@@ -75,6 +101,114 @@ function addOfferLog({ offerId, applicationId, changeType, of, toStatus, toSalar
       of?.status || '', toStatus ?? of?.status ?? '',
       num(of?.salary, 0), num(toSalary ?? of?.salary, 0),
       ts(), operator, note)
+}
+
+// ---------------- 审批引擎 ----------------
+// 审计通知：只追加不删除；recipient 指定到人，否则按角色广播
+function notify({ role = '', recipient = '', title, body = '', taskId = 0, applicationId = 0 }) {
+  db.prepare(`INSERT INTO notifications(recipient_role,recipient,kind,title,body,task_id,application_id,read,created_at)
+              VALUES(?,?,?,?,?,?,?,0,?)`)
+    .run(role, recipient, 'approval', title, body, num(taskId), num(applicationId), ts())
+}
+
+function addApprovalStep(taskId, { seq, stepRole = '', action, operator, note = '' }) {
+  db.prepare(`INSERT INTO approval_steps(task_id,seq,step_role,action,operator,note,acted_at)
+              VALUES(?,?,?,?,?,?,?)`)
+    .run(taskId, num(seq), stepRole, action, operator || '', note, ts())
+}
+
+function approvalTask(id) {
+  return db.prepare('SELECT * FROM approval_tasks WHERE id=?').get(num(id)) || null
+}
+
+// 同一应聘同类型只允许一个「审批中」任务；有「已退回」任务时应在其上修改重提，避免审批链分叉
+function assertNoOpenTask(type, applicationId, interviewId = 0) {
+  const pending = db.prepare(`SELECT id FROM approval_tasks WHERE type=? AND application_id=? AND status='pending'`).get(type, applicationId)
+  if (pending) conflict(`该候选人已有进行中的「${APPROVAL_TYPES[type].label}」审批（#${pending.id}），请勿重复提交`, 'approval_duplicate')
+  const returned = db.prepare(`SELECT id FROM approval_tasks WHERE type=? AND application_id=? AND interview_id=? AND status='returned'`).get(type, applicationId, num(interviewId))
+  if (returned) conflict(`存在被退回的「${APPROVAL_TYPES[type].label}」审批（#${returned.id}），请在审批中心修改后重新提交`, 'approval_returned_exists')
+}
+
+// 面试结论应用（审批通过的执行体）：与阶段联动、阶段快照同事务提交
+function applyInterviewConclusion(iv, a, conclusion, operator) {
+  const current = iv.conclusion || iv.result || 'pending'
+  if (conclusion === current) return { idempotent: true }
+  if (a.stage === 'hired') conflict('候选人已录用，面试结论已锁定', 'terminal_locked')
+  const stamp = ts()
+  db.prepare('UPDATE interviews SET conclusion=?, result=?, decided_at=?, decided_by=? WHERE id=?')
+    .run(conclusion, conclusion, stamp, operator, iv.id)
+  // 最近一轮「不通过」自动淘汰；淘汰态改判「通过/待定」复活回面试阶段
+  const last = latestInterviewOf(a.id)
+  if (conclusion === 'fail' && last && last.id === iv.id && a.stage !== 'rejected') {
+    const fromStage = a.stage
+    moveStage(a, 'rejected', { eventType: 'reject', operator, fromStage })
+    db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, a.id)
+  }
+  if (conclusion !== 'fail' && a.stage === 'rejected') {
+    const target = a.reject_from && STAGES.includes(a.reject_from) && STAGES.indexOf(a.reject_from) <= STAGES.indexOf('interview')
+      ? a.reject_from : 'interview'
+    moveStage(a, target, { eventType: 'rollback', operator, fromStage: 'rejected' })
+    db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(a.id)
+  }
+  return { idempotent: false }
+}
+
+// Offer 发放执行体（审批通过）：必要时协同推进到 Offer 阶段，创建/重开 Offer 并留痕
+function issueOffer(a, { salary, due, note }, operator) {
+  if (a.stage === 'rejected' || a.stage === 'hired') conflict('该候选人流程已终态，不能发放 Offer', 'terminal_locked')
+  if (STAGES.indexOf(a.stage) < STAGES.indexOf('offer')) assertCanEnterOffer(a)
+  const exist = offerOfApp(a.id)
+  if (exist && exist.status === 'pending') conflict('该候选人已有待回应的 Offer，请勿重复发起', 'offer_duplicate')
+  if (exist && (exist.status === 'accepted' || exist.status === 'joined')) conflict('该候选人的 Offer 已被接受，不能重新发起', 'offer_accepted_locked')
+  if (salary < SALARY_MIN || salary > SALARY_MAX) badRequest(`Offer 月薪需在 ${SALARY_MIN}~${SALARY_MAX} 之间`, 'salary_range')
+  const stamp = ts()
+  if (STAGES.indexOf(a.stage) < STAGES.indexOf('offer')) {
+    moveStage(a, 'offer', { eventType: 'advance', operator, fromStage: a.stage })
+  }
+  let offerId
+  if (exist) {
+    db.prepare('UPDATE offers SET salary=?, status=?, due=?, note=?, decided_at=?, decided_by=?, joined_at=? WHERE id=?')
+      .run(salary, 'pending', due || stamp, note || '', '', '', '', exist.id)
+    offerId = exist.id
+    addOfferLog({ offerId, applicationId: a.id, changeType: 'reopen', of: exist, toStatus: 'pending', toSalary: salary, operator, note: note || '' })
+  } else {
+    const r = db.prepare('INSERT INTO offers(application_id,salary,status,due,note) VALUES(?,?,?,?,?)')
+      .run(a.id, salary, 'pending', due || stamp, note || '')
+    offerId = Number(r.lastInsertRowid)
+    addOfferLog({ offerId, applicationId: a.id, changeType: 'create', of: { status: '', salary: 0 }, toStatus: 'pending', toSalary: salary, operator, note: note || '' })
+  }
+  return { offerId }
+}
+
+// 审批通过后的业务回写：推进→应用阶段；结论→面试结论+阶段联动；Offer→发放并回写 Offer 状态
+function executeApproval(task, operator) {
+  const payload = parseJSON(task.payload, {})
+  const a = db.prepare('SELECT * FROM applications WHERE id=?').get(task.application_id)
+  if (!a) badRequest('审批关联的应聘记录不存在', 'app_missing')
+  if (task.type === 'stage_advance') {
+    const to = payload.to_stage
+    if (a.stage === 'rejected') conflict('候选人已淘汰，请先「异常回退」复活后再推进', 'rejected_locked')
+    if (a.stage === to) return { detail: '已处于目标阶段，幂等通过' }
+    if (NEXT_STAGE[a.stage] !== to) conflict(`当前阶段为「${STAGE_LABEL[a.stage]}」，无法推进到「${STAGE_LABEL[to]}」，请退回该审批`, 'stage_mismatch')
+    if (to === 'offer') assertCanEnterOffer(a)
+    if (to === 'hired') {
+      const of = offerOfApp(a.id)
+      if (!of || of.status !== 'accepted') badRequest('候选人尚未接受 Offer，不能录用', 'offer_not_accepted')
+    }
+    moveStage(a, to, { eventType: 'advance', operator })
+    return { detail: `阶段已推进到「${STAGE_LABEL[to]}」` }
+  }
+  if (task.type === 'interview_conclusion') {
+    const iv = db.prepare('SELECT * FROM interviews WHERE id=?').get(num(task.interview_id))
+    if (!iv) badRequest('审批关联的面试记录不存在', 'interview_missing')
+    const r = applyInterviewConclusion(iv, a, payload.conclusion, operator)
+    return { detail: `面试结论已回写为「${{ pass: '通过', fail: '不通过', pending: '待定' }[payload.conclusion]}」${r.idempotent ? '（幂等）' : ''}` }
+  }
+  if (task.type === 'offer_issue') {
+    const r = issueOffer(a, { salary: num(payload.salary), due: payload.due, note: payload.note }, operator)
+    return { detail: `Offer 已发放（¥${num(payload.salary).toLocaleString()}/月，Offer #${r.offerId}）` }
+  }
+  badRequest('未知审批类型', 'approval_type')
 }
 
 // ---------------- 人岗匹配评分算法 ----------------
@@ -319,6 +453,25 @@ app.get('/api/state', (req, res) => {
     scoreSnapshot: parseJSON(e.score_snapshot, null)
   }))
   const jobOf = new Map(recalcJobs.map(j => [j.id, j]))
+  const members = db.prepare('SELECT * FROM members ORDER BY id').all()
+  const stepsOf = taskId => db.prepare('SELECT * FROM approval_steps WHERE task_id=? ORDER BY id').all(taskId)
+    .map(s => ({ ...s, action_label: APPROVAL_ACTION_LABEL[s.action] || s.action, role_label: ROLES[s.step_role] || '' }))
+  const approvalTasks = db.prepare('SELECT * FROM approval_tasks ORDER BY id DESC').all().map(t => {
+    const conf = APPROVAL_TYPES[t.type] || { label: t.type, chain: [] }
+    return {
+      ...t,
+      payload: parseJSON(t.payload, {}),
+      type_label: conf.label,
+      status_label: APPROVAL_STATUS_LABEL[t.status] || t.status,
+      chain: conf.chain,
+      chain_labels: conf.chain.map(r => ROLES[r]),
+      current_role: conf.chain[num(t.current_step)] || '',
+      current_role_label: ROLES[conf.chain[num(t.current_step)]] || '',
+      steps: stepsOf(t.id)
+    }
+  })
+  const notifications = db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 300').all()
+    .map(n => ({ ...n, read: !!n.read, role_label: ROLES[n.recipient_role] || '' }))
   const matches = db.prepare('SELECT * FROM matches ORDER BY id DESC').all().map(m => ({
     ...m,
     score: num(m.score),
@@ -361,7 +514,8 @@ app.get('/api/state', (req, res) => {
   })
   res.json({
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
-    strategyVersions, recalcJobs, recalcItems,
+    strategyVersions, recalcJobs, recalcItems, members, approvalTasks, notifications,
+    roles: ROLES,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP }
   })
 })
@@ -692,29 +846,11 @@ app.post('/api/applications', (req, res) => {
   res.json({ ok: true, id: out.id })
 })
 
-// 阶段推进：只能沿投递→筛选→面试→Offer→录用顺序前进，且受面试结论/Offer 状态约束
+// 阶段推进已纳入审批链：一律 403 引导到「候选人推进」审批（批准后由 executeApproval 回写阶段）
 app.post('/api/applications/:id/advance', (req, res, next) => {
-  const id = num(req.params.id)
-  const b = req.body || {}
   try {
-    const out = tx(() => {
-      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
-      if (!a) return { notFound: true }
-      checkVersion(a, b.version)
-      if (a.stage === 'rejected') conflict('候选人已淘汰，请先「异常回退」复活后再推进', 'rejected_locked')
-      const next = NEXT_STAGE[a.stage]
-      if (!next) conflict('已到最后阶段，无需重复推进', 'last_stage')
-      if (next === 'offer') assertCanEnterOffer(a)
-      // Offer → 录用只能由「接受 Offer」驱动，防止跳过候选人接受确认
-      if (next === 'hired') {
-        const of = offerOfApp(a.id)
-        if (!of || of.status !== 'accepted') badRequest('请先在 Offer 管理中等待候选人接受 Offer', 'offer_not_accepted')
-      }
-      const r = moveStage(a, next, { eventType: 'advance', operator: b.operator })
-      return { ok: true, stage: next, version: a.version, snapshot: r.snapshot }
-    })
-    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
-    res.json(out)
+    requireRole(req.body || {}, ['recruiter', 'hiring_manager'])
+    forbidden('候选人推进需提交「推进审批」，由用人经理批准后自动回写阶段', 'approval_required')
   } catch (e) { next(e) }
 })
 
@@ -722,6 +858,7 @@ app.post('/api/applications/:id/reject', (req, res, next) => {
   const id = num(req.params.id)
   const b = req.body || {}
   try {
+    requireRole(b, ['recruiter'])
     const out = tx(() => {
       const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
       if (!a) return { notFound: true }
@@ -748,6 +885,7 @@ app.post('/api/applications/:id/rollback', (req, res, next) => {
   const id = num(req.params.id)
   const b = req.body || {}
   try {
+    requireRole(b, ['recruiter'])
     const out = tx(() => {
       const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
       if (!a) return { notFound: true }
@@ -764,6 +902,7 @@ app.post('/api/applications/:id/rollback', (req, res, next) => {
 app.post('/api/applications/:id/interview', (req, res, next) => {
   const b = req.body || {}
   try {
+    requireRole(b, ['recruiter'])
     const out = tx(() => {
       const appId = num(req.params.id)
       const a = db.prepare('SELECT id,stage FROM applications WHERE id=?').get(appId)
@@ -778,64 +917,28 @@ app.post('/api/applications/:id/interview', (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// 更新面试评价/结论。结论(pass/fail/pending)与 result 双写兼容；同一结论重复提交直接幂等返回
+// 面试评价可直接编辑（面试官/招聘负责人）；面试结论已纳入审批链，需提交「面试结论」审批
 app.post('/api/interviews/:id', (req, res, next) => {
   const b = req.body || {}
   const ivId = num(req.params.id)
   try {
+    requireRole(b, ['interviewer', 'recruiter'])
+    const wantsConclusion = ['pass', 'fail', 'pending'].includes(b.conclusion) || ['pass', 'fail', 'pending'].includes(b.result)
+    if (wantsConclusion) forbidden('面试结论需提交「面试结论审批」，由招聘负责人批准后自动回写并联动阶段', 'approval_required')
     const out = tx(() => {
       const iv = db.prepare('SELECT * FROM interviews WHERE id=?').get(ivId)
       if (!iv) return { notFound: true }
-      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(iv.application_id)
-      if (!a) return { appNotFound: true }
       const sets = [], vals = []
       if (b.eval !== undefined) { sets.push('eval=?'); vals.push(String(b.eval)) }
       if (b.interviewer !== undefined) { sets.push('interviewer=?'); vals.push(String(b.interviewer)) }
       if (b.time !== undefined) { sets.push('time=?'); vals.push(String(b.time)) }
-
-      const conclusion = ['pass', 'fail', 'pending'].includes(b.conclusion)
-        ? b.conclusion
-        : (['pass', 'fail', 'pending'].includes(b.result) ? b.result : null)
-      let idempotent = false
-      if (conclusion) {
-        const current = iv.conclusion || iv.result || 'pending'
-        if (a.stage === 'hired' && conclusion !== current) {
-          conflict('候选人已录用，面试结论已锁定', 'terminal_locked')
-        }
-        if (conclusion === current) {
-          idempotent = true
-        } else {
-          const stamp = ts()
-          sets.push('conclusion=?', 'result=?', 'decided_at=?', 'decided_by=?')
-          vals.push(conclusion, conclusion, stamp, b.operator || a.recruiter || 'HR-Sandy')
-          // 最近一轮给出「不通过」结论：应聘自动淘汰并固化阶段事件（仅对最近一轮生效，历史轮次改判不联动）
-          const last = latestInterviewOf(a.id)
-          if (conclusion === 'fail' && last && last.id === iv.id && a.stage !== 'rejected') {
-            const fromStage = a.stage
-            moveStage(a, 'rejected', {
-              eventType: 'reject', operator: b.operator, fromStage
-            })
-            db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, a.id)
-          }
-          // 淘汰状态下「改判通过/待定」可复活：回到面试阶段（单步回退，避免跨阶段跳变）
-          if (conclusion !== 'fail' && a.stage === 'rejected') {
-            const target = a.reject_from && STAGES.includes(a.reject_from) && STAGES.indexOf(a.reject_from) <= STAGES.indexOf('interview')
-              ? a.reject_from : 'interview'
-            moveStage(a, target, { eventType: 'rollback', operator: b.operator, fromStage: 'rejected' })
-            db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(a.id)
-          }
-          vals.push(ivId)
-          db.prepare(`UPDATE interviews SET ${sets.join(',')} WHERE id=?`).run(...vals)
-          return { ok: true, idempotent, conclusion, version: a.version }
-        }
-      }
       if (sets.length) {
         vals.push(ivId)
         db.prepare(`UPDATE interviews SET ${sets.join(',')} WHERE id=?`).run(...vals)
       }
-      return { ok: true, idempotent, conclusion: conclusion || iv.conclusion || iv.result, version: num(a.version) }
+      return { ok: true, conclusion: iv.conclusion || iv.result }
     })
-    if (out.notFound || out.appNotFound) return res.status(404).json({ ok: false, code: 'not_found' })
+    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
     res.json(out)
   } catch (e) { next(e) }
 })
@@ -843,51 +946,11 @@ app.post('/api/interviews/:id', (req, res, next) => {
 // ---------------- Offer ----------------
 const SALARY_MIN = 1000, SALARY_MAX = 1000000
 
-// 发起 Offer：必须处于 Offer 阶段（非终态）；同一应聘同时只能有一个进行中的 Offer，重复发起直接拒绝
+// 发起 Offer 已纳入审批链：一律 403 引导到「Offer 发放」审批（批准后由 executeApproval 发放并回写）
 app.post('/api/applications/:id/offer', (req, res, next) => {
-  const b = req.body || {}
-  const appId = num(req.params.id)
   try {
-    const out = tx(() => {
-      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(appId)
-      if (!a) return { notFound: true }
-      checkVersion(a, b.version)
-      if (a.stage === 'rejected' || a.stage === 'hired') conflict('该候选人流程已终态，不能发起 Offer', 'terminal_locked')
-      // 发起 Offer 前同样受面试结论约束
-      if (STAGES.indexOf(a.stage) < STAGES.indexOf('offer')) assertCanEnterOffer(a)
-      const exist = offerOfApp(a.id)
-      if (exist && exist.status === 'pending') conflict('该候选人已有待回应的 Offer，请勿重复发起', 'offer_duplicate')
-      if (exist && (exist.status === 'accepted' || exist.status === 'joined')) {
-        conflict('该候选人的 Offer 已被接受，不能重新发起', 'offer_accepted_locked')
-      }
-      let salary = num(b.salary, 20000)
-      if (salary < SALARY_MIN || salary > SALARY_MAX) badRequest(`Offer 月薪需在 ${SALARY_MIN}~${SALARY_MAX} 之间`, 'salary_range')
-      const stamp = ts()
-      const operator = b.operator || a.recruiter || 'HR-Sandy'
-      // 候选人还停留在面试阶段：发起即协同推进到 Offer（同事务写阶段事件+快照）
-      if (STAGES.indexOf(a.stage) < STAGES.indexOf('offer')) {
-        moveStage(a, 'offer', { eventType: 'advance', operator, fromStage: a.stage })
-      }
-      let offerId
-      if (exist) {
-        // 复用被撤回/拒绝的旧记录：重新发起，保留薪资历史可追溯
-        db.prepare('UPDATE offers SET salary=?, status=?, due=?, note=?, decided_at=?, decided_by=?, joined_at=? WHERE id=?')
-          .run(salary, 'pending', b.due || stamp, b.note || '', '', '', '', exist.id)
-        offerId = exist.id
-        addOfferLog({ offerId, applicationId: appId, changeType: 'reopen', of: exist, toStatus: 'pending', toSalary: salary, operator, note: b.note || '' })
-      } else {
-        const r = db.prepare('INSERT INTO offers(application_id,salary,status,due,note) VALUES(?,?,?,?,?)')
-          .run(appId, salary, 'pending', b.due || stamp, b.note || '')
-        offerId = Number(r.lastInsertRowid)
-        addOfferLog({
-          offerId, applicationId: appId, changeType: 'create',
-          of: { status: '', salary: 0 }, toStatus: 'pending', toSalary: salary, operator, note: b.note || ''
-        })
-      }
-      return { ok: true, id: offerId, stage: a.stage, version: a.version }
-    })
-    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
-    res.json(out)
+    requireRole(req.body || {}, ['recruiter'])
+    forbidden('Offer 发放需提交「Offer 发放审批」，经用人经理→招聘负责人批准后自动发放', 'approval_required')
   } catch (e) { next(e) }
 })
 
@@ -899,6 +962,7 @@ app.post('/api/offers/:id', (req, res, next) => {
   const b = req.body || {}
   const offerId = num(req.params.id)
   try {
+    requireRole(b, ['recruiter'])
     const out = tx(() => {
       const of = db.prepare('SELECT * FROM offers WHERE id=?').get(offerId)
       if (!of) return { notFound: true }
@@ -974,6 +1038,212 @@ app.post('/api/offers/:id', (req, res, next) => {
     if (out.appNotFound) return res.status(409).json({ ok: false, code: 'app_missing', msg: 'Offer 对应的应聘记录不存在' })
     res.json(out)
   } catch (e) { next(e) }
+})
+
+// ---------------- 审批链 ----------------
+// 提交审批：按类型校验发起角色与参数，生成任务+首个「提交」步骤，并通知首节点审批角色
+app.post('/api/approvals', (req, res, next) => {
+  const b = req.body || {}
+  try {
+    const type = b.type
+    const conf = APPROVAL_TYPES[type]
+    if (!conf) badRequest('未知审批类型', 'approval_type')
+    requireRole(b, APPROVAL_REQUESTER[type])
+    const operator = String(b.operator || '').trim()
+    if (!operator) badRequest('缺少操作人', 'operator_required')
+    const appId = num(b.application_id)
+    const payload = b.payload || {}
+
+    const out = tx(() => {
+      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(appId)
+      if (!a) return { notFound: true }
+      const c = db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
+      const p = db.prepare('SELECT name FROM positions WHERE id=?').get(a.position_id)
+      const who = `${c?.name || '候选人'} · ${p?.name || '职位'}`
+
+      // 按类型做提交前校验（执行时会再校验一次，双保险）
+      let interviewId = 0
+      if (type === 'stage_advance') {
+        const to = payload.to_stage
+        if (a.stage === 'rejected') conflict('候选人已淘汰，请先「异常回退」复活', 'rejected_locked')
+        if (NEXT_STAGE[a.stage] !== to) badRequest(`当前阶段为「${STAGE_LABEL[a.stage]}」，只能推进到「${STAGE_LABEL[NEXT_STAGE[a.stage]] || '终点'}」`, 'stage_mismatch')
+        if (to === 'offer') assertCanEnterOffer(a)
+        if (to === 'hired') {
+          const of = offerOfApp(a.id)
+          if (!of || of.status !== 'accepted') badRequest('候选人尚未接受 Offer，不能申请录用', 'offer_not_accepted')
+        }
+        assertNoOpenTask(type, appId)
+      } else if (type === 'interview_conclusion') {
+        interviewId = num(b.interview_id)
+        const iv = db.prepare('SELECT * FROM interviews WHERE id=?').get(interviewId)
+        if (!iv || iv.application_id !== appId) badRequest('面试记录不存在或不属于该应聘', 'interview_missing')
+        if (!['pass', 'fail', 'pending'].includes(payload.conclusion)) badRequest('面试结论只能为 通过/不通过/待定', 'conclusion_invalid')
+        if (a.stage === 'hired') conflict('候选人已录用，面试结论已锁定', 'terminal_locked')
+        const current = iv.conclusion || iv.result || 'pending'
+        if (payload.conclusion === current) conflict(`「${iv.round}」已是该结论，无需重复提交审批`, 'conclusion_same')
+        assertNoOpenTask(type, appId, interviewId)
+      } else if (type === 'offer_issue') {
+        const salary = num(payload.salary)
+        if (salary < SALARY_MIN || salary > SALARY_MAX) badRequest(`Offer 月薪需在 ${SALARY_MIN}~${SALARY_MAX} 之间`, 'salary_range')
+        if (a.stage === 'rejected' || a.stage === 'hired') conflict('该候选人流程已终态，不能发放 Offer', 'terminal_locked')
+        if (STAGES.indexOf(a.stage) < STAGES.indexOf('offer')) assertCanEnterOffer(a)
+        const exist = offerOfApp(a.id)
+        if (exist && exist.status === 'pending') conflict('该候选人已有待回应的 Offer', 'offer_duplicate')
+        if (exist && (exist.status === 'accepted' || exist.status === 'joined')) conflict('该候选人的 Offer 已被接受', 'offer_accepted_locked')
+        assertNoOpenTask(type, appId)
+      }
+
+      const stamp = ts()
+      const r = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,payload,status,current_step,requested_by,requested_by_role,requested_at,updated)
+                            VALUES(?,?,?,?,'pending',0,?,?,?,?)`)
+        .run(type, appId, interviewId, JSON.stringify(payload), operator, b.role, stamp, stamp)
+      const taskId = Number(r.lastInsertRowid)
+      addApprovalStep(taskId, { seq: 0, stepRole: b.role, action: 'submit', operator, note: b.note || '' })
+      notify({
+        role: conf.chain[0],
+        title: `【${conf.label}】待审批：${who}`,
+        body: `${operator} 提交了「${conf.label}」审批，请及时处理`,
+        taskId, applicationId: appId
+      })
+      return { ok: true, id: taskId }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found', msg: '应聘记录不存在' })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 审批/退回：仅当前节点角色可处理；批准到末节点时在同事务执行回写；退回则打回发起人
+app.post('/api/approvals/:id/act', (req, res, next) => {
+  const b = req.body || {}
+  try {
+    const action = b.action
+    if (!['approve', 'return'].includes(action)) badRequest('审批动作只能为 approve/return', 'approval_action')
+    const operator = String(b.operator || '').trim()
+    if (!operator) badRequest('缺少操作人', 'operator_required')
+    const out = tx(() => {
+      const t = approvalTask(req.params.id)
+      if (!t) return { notFound: true }
+      if (t.status !== 'pending') conflict(`该审批已${APPROVAL_STATUS_LABEL[t.status]}，请勿重复处理`, 'approval_done')
+      const conf = APPROVAL_TYPES[t.type]
+      const stepIdx = num(t.current_step)
+      const needRole = conf.chain[stepIdx]
+      requireRole(b, [needRole])
+      if (operator === t.requested_by) forbidden('不能审批自己提交的申请', 'self_approval')
+      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(t.application_id)
+      const c = a ? db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id) : null
+      const who = c?.name || '候选人'
+      const stamp = ts()
+
+      if (action === 'return') {
+        db.prepare("UPDATE approval_tasks SET status='returned', decided_at=?, decide_note=?, updated=? WHERE id=?")
+          .run(stamp, b.note || '', stamp, t.id)
+        addApprovalStep(t.id, { seq: stepIdx, stepRole: needRole, action: 'return', operator, note: b.note || '' })
+        notify({
+          role: t.requested_by_role, recipient: t.requested_by,
+          title: `【${conf.label}】已退回：${who}`,
+          body: `${operator}（${ROLES[needRole]}）退回了你的「${conf.label}」审批${b.note ? `：${b.note}` : ''}，可修改后重新提交`,
+          taskId: t.id, applicationId: t.application_id
+        })
+        return { ok: true, status: 'returned' }
+      }
+
+      // 批准：记录本节点；未到末节点则流转下一节点，到末节点则执行回写
+      addApprovalStep(t.id, { seq: stepIdx, stepRole: needRole, action: 'approve', operator, note: b.note || '' })
+      if (stepIdx < conf.chain.length - 1) {
+        db.prepare('UPDATE approval_tasks SET current_step=?, updated=? WHERE id=?').run(stepIdx + 1, stamp, t.id)
+        notify({
+          role: conf.chain[stepIdx + 1],
+          title: `【${conf.label}】待终审：${who}`,
+          body: `「${conf.label}」审批已经${ROLES[needRole]}批准，等待你终审`,
+          taskId: t.id, applicationId: t.application_id
+        })
+        return { ok: true, status: 'pending', next_step: stepIdx + 1 }
+      }
+      const result = executeApproval(t, t.requested_by)
+      db.prepare("UPDATE approval_tasks SET status='approved', decided_at=?, decide_note=?, updated=? WHERE id=?")
+        .run(stamp, b.note || '', stamp, t.id)
+      notify({
+        role: t.requested_by_role, recipient: t.requested_by,
+        title: `【${conf.label}】已通过：${who}`,
+        body: `你的「${conf.label}」审批已通过。${result.detail}`,
+        taskId: t.id, applicationId: t.application_id
+      })
+      return { ok: true, status: 'approved', detail: result.detail }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found', msg: '审批任务不存在' })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 重新提交：仅发起人、仅「已退回」状态；可修改参数快照后回到审批链首节点
+app.post('/api/approvals/:id/resubmit', (req, res, next) => {
+  const b = req.body || {}
+  try {
+    const operator = String(b.operator || '').trim()
+    const out = tx(() => {
+      const t = approvalTask(req.params.id)
+      if (!t) return { notFound: true }
+      if (t.status !== 'returned') conflict('仅「已退回」的审批可以重新提交', 'approval_not_returned')
+      if (operator !== t.requested_by) forbidden('只有发起人本人可以重新提交', 'not_requester')
+      const conf = APPROVAL_TYPES[t.type]
+      // 合并修改后的参数并重新做提交前校验
+      const payload = { ...parseJSON(t.payload, {}), ...(b.payload || {}) }
+      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(t.application_id)
+      if (!a) return { notFound: true }
+      if (t.type === 'stage_advance') {
+        if (NEXT_STAGE[a.stage] !== payload.to_stage) badRequest(`当前阶段为「${STAGE_LABEL[a.stage]}」，目标阶段需调整为「${STAGE_LABEL[NEXT_STAGE[a.stage]] || '终点'}」`, 'stage_mismatch')
+        if (payload.to_stage === 'offer') assertCanEnterOffer(a)
+      } else if (t.type === 'interview_conclusion') {
+        if (!['pass', 'fail', 'pending'].includes(payload.conclusion)) badRequest('面试结论只能为 通过/不通过/待定', 'conclusion_invalid')
+      } else if (t.type === 'offer_issue') {
+        const salary = num(payload.salary)
+        if (salary < SALARY_MIN || salary > SALARY_MAX) badRequest(`Offer 月薪需在 ${SALARY_MIN}~${SALARY_MAX} 之间`, 'salary_range')
+        const exist = offerOfApp(a.id)
+        if (exist && exist.status === 'pending') conflict('该候选人已有待回应的 Offer', 'offer_duplicate')
+      }
+      const stamp = ts()
+      db.prepare("UPDATE approval_tasks SET payload=?, status='pending', current_step=0, decided_at='', decide_note='', updated=? WHERE id=?")
+        .run(JSON.stringify(payload), stamp, t.id)
+      addApprovalStep(t.id, { seq: 0, stepRole: t.requested_by_role, action: 'resubmit', operator, note: b.note || '' })
+      notify({
+        role: conf.chain[0],
+        title: `【${conf.label}】重新提交待审批`,
+        body: `${operator} 修改后重新提交了「${conf.label}」审批（#${t.id}）`,
+        taskId: t.id, applicationId: t.application_id
+      })
+      return { ok: true, status: 'pending' }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found', msg: '审批任务不存在' })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 取消：仅发起人，审批中/已退回可取消
+app.post('/api/approvals/:id/cancel', (req, res, next) => {
+  const b = req.body || {}
+  try {
+    const operator = String(b.operator || '').trim()
+    const out = tx(() => {
+      const t = approvalTask(req.params.id)
+      if (!t) return { notFound: true }
+      if (!['pending', 'returned'].includes(t.status)) conflict('仅审批中/已退回的审批可以取消', 'approval_done')
+      if (operator !== t.requested_by) forbidden('只有发起人本人可以取消', 'not_requester')
+      const stamp = ts()
+      db.prepare("UPDATE approval_tasks SET status='cancelled', updated=? WHERE id=?").run(stamp, t.id)
+      addApprovalStep(t.id, { seq: num(t.current_step), stepRole: t.requested_by_role, action: 'cancel', operator, note: b.note || '' })
+      return { ok: true, status: 'cancelled' }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found', msg: '审批任务不存在' })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 通知已读：按角色（+本人）一键已读
+app.post('/api/notifications/read', (req, res) => {
+  const b = req.body || {}
+  db.prepare(`UPDATE notifications SET read=1 WHERE read=0 AND (recipient=? OR (recipient='' AND recipient_role=?))`)
+    .run(String(b.operator || ''), String(b.role || ''))
+  res.json({ ok: true })
 })
 
 // ---------------- 渠道 ----------------

@@ -182,6 +182,60 @@ CREATE TABLE IF NOT EXISTS channels (
   name TEXT NOT NULL,
   cost INTEGER NOT NULL DEFAULT 0
 );
+
+-- 平台成员与角色：recruiter=招聘负责人 / interviewer=面试官 / hiring_manager=用人经理
+CREATE TABLE IF NOT EXISTS members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT ''
+);
+
+-- 审批任务：候选人推进 / 面试结论 / Offer 发放，可退回-修改-重新提交，最终批准后在同事务回写业务状态
+CREATE TABLE IF NOT EXISTS approval_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,               -- stage_advance/interview_conclusion/offer_issue
+  application_id INTEGER NOT NULL,
+  interview_id INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL DEFAULT '{}', -- 请求参数快照：{to_stage}/{conclusion}/{salary,due,note}
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/returned/cancelled
+  current_step INTEGER NOT NULL DEFAULT 0,  -- 当前待审批节点（审批链下标）
+  requested_by TEXT NOT NULL DEFAULT '',
+  requested_by_role TEXT NOT NULL DEFAULT '',
+  requested_at TEXT NOT NULL DEFAULT '',
+  decided_at TEXT NOT NULL DEFAULT '',
+  decide_note TEXT NOT NULL DEFAULT '',
+  updated TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_approval_tasks_app ON approval_tasks(application_id, id);
+
+-- 审批链留痕：提交/重新提交/批准/退回/取消逐步追加，只增不改
+CREATE TABLE IF NOT EXISTS approval_steps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  step_role TEXT NOT NULL DEFAULT '',  -- 该节点要求的审批角色
+  action TEXT NOT NULL DEFAULT '',     -- submit/resubmit/approve/return/cancel
+  operator TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  acted_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_approval_steps_task ON approval_steps(task_id, id);
+
+-- 审计通知：审批提交/批准/退回/执行结果只追加保留，供按角色查阅
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient_role TEXT NOT NULL DEFAULT '',
+  recipient TEXT NOT NULL DEFAULT '',   -- 指定到人时优先按人匹配
+  kind TEXT NOT NULL DEFAULT 'approval',
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  task_id INTEGER NOT NULL DEFAULT 0,
+  application_id INTEGER NOT NULL DEFAULT 0,
+  read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, id);
 `)
 
 // ---------------- 兼容已有库：补列迁移 ----------------
@@ -287,8 +341,29 @@ function seed() {
 
   const iCh = db.prepare('INSERT INTO channels(name,cost) VALUES(?,?)')
   ;[['内推', 0], ['Boss直聘', 6000], ['猎头', 20000], ['校招', 8000], ['站酷', 4000]].forEach(ch => iCh.run(...ch))
+
+  const iM = db.prepare('INSERT INTO members(name,role,title) VALUES(?,?,?)')
+  ;[
+    ['王莉', 'recruiter', '招聘负责人'],
+    ['赵敏', 'recruiter', '招聘负责人'],
+    ['李强', 'interviewer', '面试官'],
+    ['周洁', 'interviewer', '面试官'],
+    ['张总', 'hiring_manager', '用人经理']
+  ].forEach(m => iM.run(...m))
 }
 seed()
+
+// 旧库补种成员表（表结构由上方 CREATE IF NOT EXISTS 保证）
+if (db.prepare('SELECT COUNT(*) c FROM members').get().c === 0) {
+  const iM = db.prepare('INSERT INTO members(name,role,title) VALUES(?,?,?)')
+  ;[
+    ['王莉', 'recruiter', '招聘负责人'],
+    ['赵敏', 'recruiter', '招聘负责人'],
+    ['李强', 'interviewer', '面试官'],
+    ['周洁', 'interviewer', '面试官'],
+    ['张总', 'hiring_manager', '用人经理']
+  ].forEach(m => iM.run(...m))
+}
 
 export default db
 export { now, ts, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP }

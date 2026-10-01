@@ -26,12 +26,18 @@ function lastInterview(a) {
 }
 function conclusionOf(iv) { return iv.conclusion || iv.result || 'pending' }
 
-// 仅评价文本/面试官变更，不打 toast
+// 仅评价文本/面试官变更，不打 toast（面试官/招聘负责人可直接编辑）
 function saveEval(iv) { store.setInterview(iv.id, { eval: iv.eval, interviewer: iv.interviewer }) }
-// 结论变更：服务端会联动阶段（fail→自动淘汰；淘汰态改判→复活）
+
+// 该轮面试是否有进行中的结论审批
+function pendingConclusion(iv) {
+  return store.approvals.find(t => t.type === 'interview_conclusion' && t.interview_id === iv.id && t.status === 'pending') || null
+}
+// 结论变更已纳入审批链：提交「面试结论」审批，招聘负责人批准后回写并联动阶段
+const canRequestConclusion = computed(() => ['interviewer', 'recruiter'].includes(store.myRole))
 function setConclusion(iv, c) {
-  if (conclusionOf(iv) === c) return
-  store.setInterview(iv.id, { conclusion: c })
+  if (conclusionOf(iv) === c || pendingConclusion(iv)) return
+  store.requestApproval({ type: 'interview_conclusion', application_id: iv.application_id, interview_id: iv.id, payload: { conclusion: c } })
 }
 const roundOpts = ['初试', '复试', '终面', 'HR面']
 function addRound() {
@@ -39,11 +45,11 @@ function addRound() {
   const round = roundOpts.find(r => !used.has(r)) || `第${(detail.value.interviews?.length || 0) + 1}轮`
   store.addInterview(detail.value.id, { round, interviewer: '', time: '待定' })
 }
-// 通过结论 + 协同推进到 Offer（推进接口再校验一次结论，双保险）
+// 通过结论 + 提交推进到 Offer 的审批（审批执行时服务端再校验一次结论，双保险）
 function passAndAdvance(a) {
   const iv = lastInterview(a)
   if (!iv || conclusionOf(iv) !== 'pass') return
-  store.advance(a.id, a.version)
+  store.requestApproval({ type: 'stage_advance', application_id: a.id, payload: { to_stage: 'offer' } })
 }
 </script>
 
@@ -88,11 +94,12 @@ function passAndAdvance(a) {
               <span class="rtag">{{ iv.round }}</span>
               <input v-model="iv.interviewer" placeholder="面试官姓名" @change="saveEval(iv)" />
               <div class="ivres">
-                <button class="succ" :class="{ on: conclusionOf(iv) === 'pass' }" @click="setConclusion(iv, 'pass')">✅ 通过</button>
-                <button class="danger" :class="{ on: conclusionOf(iv) === 'fail' }" @click="setConclusion(iv, 'fail')">❌ 不通过</button>
-                <button class="ghost" :class="{ on: conclusionOf(iv) === 'pending' }" @click="setConclusion(iv, 'pending')">⏳ 待定</button>
+                <button class="succ" :class="{ on: conclusionOf(iv) === 'pass' }" :disabled="!canRequestConclusion || !!pendingConclusion(iv)" @click="setConclusion(iv, 'pass')">✅ 通过</button>
+                <button class="danger" :class="{ on: conclusionOf(iv) === 'fail' }" :disabled="!canRequestConclusion || !!pendingConclusion(iv)" @click="setConclusion(iv, 'fail')">❌ 不通过</button>
+                <button class="ghost" :class="{ on: conclusionOf(iv) === 'pending' }" :disabled="!canRequestConclusion || !!pendingConclusion(iv)" @click="setConclusion(iv, 'pending')">⏳ 待定</button>
               </div>
             </div>
+            <div class="appr-pending" v-if="pendingConclusion(iv)">⏳ 结论审批中（{{ pendingConclusion(iv).payload.conclusion === 'pass' ? '通过' : pendingConclusion(iv).payload.conclusion === 'fail' ? '不通过' : '待定' }}），待{{ pendingConclusion(iv).current_role_label }}批准后生效</div>
             <textarea v-model="iv.eval" placeholder="填写面试评价……" rows="2" @change="saveEval(iv)"></textarea>
             <div class="muted" v-if="iv.id === lastInterview(detail)?.id">
               {{ conclusionOf(iv) === 'fail'
@@ -105,11 +112,12 @@ function passAndAdvance(a) {
         </div>
         <div class="acts">
           <button class="primary" @click="addRound">＋ 添加下一轮面试</button>
-          <button class="succ" :disabled="detail.stage !== 'interview' || conclusionOf(lastInterview(detail)) !== 'pass'"
+          <button class="succ" :disabled="detail.stage !== 'interview' || conclusionOf(lastInterview(detail)) !== 'pass' || store.myRole !== 'recruiter' || !!store.pendingApprovalOf(detail.id, 'stage_advance')"
+            :title="store.myRole !== 'recruiter' ? '仅招聘负责人可发起推进审批' : '提交推进审批，用人经理批准后进入 Offer'"
             @click="passAndAdvance(detail)">→ 通过并推进到 Offer</button>
           <button class="ghost" @click="detail = null">关闭</button>
         </div>
-        <div class="muted tip">面试结论是进入 Offer 的硬约束；结论变更与阶段联动、阶段快照在同一事务提交。</div>
+        <div class="muted tip">面试结论经「结论审批」（招聘负责人批准）后回写；推进 Offer 经「推进审批」（用人经理批准）后生效，均可退回重提。</div>
       </div>
     </div>
   </div>
@@ -139,6 +147,8 @@ function passAndAdvance(a) {
 .ivres { display: flex; gap: 6px; margin-left: auto; }
 .ivres button.on.succ { background: var(--green); color: #06231a; }
 .ivres button.on.danger { background: var(--red); color: #fff; }
+.ivres button:disabled { opacity: .5; cursor: not-allowed; }
+.appr-pending { font-size: 11px; color: var(--accent2); background: rgba(255,209,102,.08); border: 1px solid rgba(255,209,102,.3); border-radius: 8px; padding: 5px 9px; margin-bottom: 8px; }
 .acts { display: flex; gap: 8px; flex-wrap: wrap; }
 .tip { margin-top: 10px; font-size: 12px; }
 textarea { width: 100%; background: #101731; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; }

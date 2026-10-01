@@ -18,11 +18,15 @@ function openMake(a) {
   const p = store.positions.find(p => p.id === a.position_id)
   offerAmt.value = Math.round(a.offer?.salary || (p ? (p.salary_min + p.salary_max) / 2 : 22000))
 }
+// Offer 发放已纳入两级审批链：用人经理 → 招聘负责人终审，批准后自动发放并回写
 function makeOffer() {
   const a = detail.value
-  store.addOffer(a.id, { salary: offerAmt.value, version: a.version })
+  store.requestApproval({ type: 'offer_issue', application_id: a.id, payload: { salary: offerAmt.value } })
   detail.value = null
 }
+// 该应聘进行中的 Offer 审批
+function pendingIssue(a) { return store.pendingApprovalOf(a.id, 'offer_issue') }
+const isRecruiter = computed(() => store.myRole === 'recruiter')
 
 function openEdit(a) {
   editTarget.value = a
@@ -60,7 +64,9 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
           <div class="ocard" v-for="a in offerApps" :key="a.id">
             <div><b>{{ a.candidate }}</b><em class="muted">{{ a.position }}</em></div>
             <div class="muted">{{ a.city }}<span v-if="a.offer?.status === 'withdrawn'" class="reissue-hint">· 上次已撤回，可重新发起</span><span v-else-if="a.offer?.status === 'rejected'" class="reissue-hint">· 上次被拒绝，可重新发起</span></div>
-            <button class="primary" @click="openMake(a)">{{ a.offer ? '重新发起' : '发起 Offer' }}</button>
+            <span v-if="pendingIssue(a)" class="issue-pending">⏳ 发放审批中 · 待{{ pendingIssue(a).current_role_label }}</span>
+            <button v-else class="primary" :disabled="!isRecruiter" :title="!isRecruiter ? '仅招聘负责人可发起 Offer 审批' : '提交发放审批，批准后自动发送'"
+              @click="openMake(a)">{{ a.offer ? '重新发起' : '发起 Offer' }}</button>
           </div>
           <div class="muted empty" v-if="!offerApps.length">当前无待发 Offer，先在「面试管理」给出通过结论并推进至 Offer 阶段。</div>
         </div>
@@ -78,17 +84,17 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
               <span class="ostatus" :style="{ color: ofStatus(a.offer.status)[2], borderColor: ofStatus(a.offer.status)[2] }">
                 {{ ofStatus(a.offer.status)[0] }} {{ ofStatus(a.offer.status)[1] }}
               </span>
-              <!-- 待回应：可调薪/接受/拒绝/撤回 -->
+              <!-- 待回应：可调薪/接受/拒绝/撤回（仅招聘负责人） -->
               <template v-if="a.offer.status === 'pending'">
-                <button class="ghost sm" @click="openEdit(a)">✏️ 调薪</button>
-                <button class="succ sm" :disabled="busy(a.offer.id)" @click="setStatus(a, 'accepted')">接受</button>
-                <button class="primary sm" :disabled="busy(a.offer.id)" @click="setStatus(a, 'rejected')">拒绝</button>
-                <button class="warn sm" :disabled="busy(a.offer.id)" @click="withdraw(a)">撤回</button>
+                <button class="ghost sm" :disabled="!isRecruiter" @click="openEdit(a)">✏️ 调薪</button>
+                <button class="succ sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'accepted')">接受</button>
+                <button class="primary sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'rejected')">拒绝</button>
+                <button class="warn sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="withdraw(a)">撤回</button>
               </template>
               <!-- 已接受（=录用待入职）：确认入职或撤回 -->
               <template v-else-if="a.offer.status === 'accepted'">
-                <button class="primary sm" :disabled="busy(a.offer.id)" @click="setStatus(a, 'joined')">确认入职</button>
-                <button class="warn sm" :disabled="busy(a.offer.id)" @click="withdraw(a)">撤回</button>
+                <button class="primary sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'joined')">确认入职</button>
+                <button class="warn sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="withdraw(a)">撤回</button>
               </template>
               <!-- 已撤回/已拒绝：在 Offer 阶段时可重新发起 -->
               <button v-else-if="['withdrawn','rejected'].includes(a.offer.status) && a.stage === 'offer'" class="succ sm" @click="openMake(a)">重新发起</button>
@@ -99,22 +105,22 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
       </div>
     </div>
 
-    <!-- 发起 / 重新发起 Offer -->
+    <!-- 发起 / 重新发起 Offer（提交两级审批） -->
     <div class="modal" v-if="detail" @click.self="detail = null">
       <div class="modal-box card">
         <h3>📄 {{ detail.offer ? '重新发起 Offer' : '发起 Offer' }}</h3>
         <div class="ofinfo">
           <div><span class="muted">候选人</span><b>{{ detail.candidate }}</b></div>
           <div><span class="muted">职位</span><b>{{ detail.position }} · {{ detail.dept }}</b></div>
-          <div><span class="muted">阶段</span><b>Offer 沟通</b></div>
+          <div><span class="muted">审批链</span><b>用人经理 → 招聘负责人终审</b></div>
         </div>
-        <label class="muted">Offer 月薪（1,000 ~ 1,000,000，变更全程留痕）</label>
+        <label class="muted">Offer 月薪（1,000 ~ 1,000,000，批准后自动发放并留痕）</label>
         <div class="sal-input">
           <input type="number" v-model.number="offerAmt" min="1000" max="1000000" />
           <span class="muted">¥/月</span>
         </div>
         <div class="acts">
-          <button class="primary" @click="makeOffer">确认发送</button>
+          <button class="primary" @click="makeOffer">提交发放审批</button>
           <button class="ghost" @click="detail = null">取消</button>
         </div>
       </div>
@@ -150,6 +156,7 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
 .ocard b { display: block; }
 .ocard em { font-style: normal; font-size: 11px; margin-left: 6px; }
 .reissue-hint { margin-left: 4px; }
+.issue-pending { font-size: 11px; color: var(--accent2); background: rgba(255,209,102,.1); border: 1px solid rgba(255,209,102,.35); padding: 3px 9px; border-radius: 10px; }
 .op-acts { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .ostatus { font-size: 11px; border: 1px solid; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
 button.sm { font-size: 11px; padding: 4px 9px; }
