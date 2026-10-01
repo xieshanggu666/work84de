@@ -155,14 +155,24 @@ function advanceGate(a) {
   return { blocked: false }
 }
 function busyKey(a) { return `stage:${a.id}` }
-function isBusy(a) { return !!store.pending[busyKey(a)] }
+function isBusy(a) { return !!store.pending[busyKey(a)] || !!store.pending[`appr-new:stage_advance:${a.id}`] }
+
+// ---- 角色权限与审批联动 ----
+// 推进/淘汰/回退属招聘负责人职责；推进不再直接生效，而是提交「候选人推进」审批，由用人经理审批后回写阶段
+const isRecruiter = computed(() => store.myRole === 'recruiter')
+function pendingTaskOf(a, type) { return store.pendingTask(a.id, type) }
+function anyPendingTask(a) {
+  return ['stage_advance', 'interview_conclusion', 'offer_issue'].map(t => pendingTaskOf(a, t)).find(Boolean) || null
+}
+const TASK_TYPE_LABEL = { stage_advance: '推进', interview_conclusion: '结论', offer_issue: 'Offer' }
 
 function onAdvance(a) {
-  if (advanceGate(a).blocked) return
-  store.advance(a.id, a.version)
+  if (advanceGate(a).blocked || !isRecruiter.value) return
+  const target = nextStage(a.stage)
+  store.submitApproval({ type: 'stage_advance', application_id: a.id, payload: { target_stage: target } })
 }
-function onReject(a) { store.reject(a.id, a.version) }
-function onRollback(a) { store.rollback(a.id, a.version) }
+function onReject(a) { if (isRecruiter.value) store.reject(a.id, a.version) }
+function onRollback(a) { if (isRecruiter.value) store.rollback(a.id, a.version) }
 
 const traceApp = computed(() => store.applications.find(a => a.id === traceAppId.value) || null)
 const traceEvents = computed(() => {
@@ -212,7 +222,7 @@ function weightText(weights = {}) {
     </div>
 
     <div class="consistency card">
-      <span>🔒 一致性：推进/回退/Offer 变更与阶段快照、事件留痕在同一事务提交，并带乐观锁版本防重复操作；进入 Offer 需最近一轮面试结论为<b>通过</b>，录用只能由<b>接受 Offer</b> 驱动；重算只更新 matches / recalc_items，不覆盖阶段证据。</span>
+      <span>🔒 一致性：阶段推进需经<b>审批链</b>（招聘负责人提请 → 用人经理审批）通过后回写；回退/淘汰/Offer 变更与阶段快照、事件留痕在同一事务提交，并带乐观锁版本防重复操作；进入 Offer 需最近一轮面试结论为<b>通过</b>，录用只能由<b>接受 Offer</b> 驱动。</span>
     </div>
 
     <!-- Kanban -->
@@ -262,7 +272,7 @@ function weightText(weights = {}) {
               </span>
             </div>
             <div class="kskills"><span class="skill-chip" v-for="sk in (a.candSkills||[]).slice(0,4)" :key="sk.k">{{ sk.k }}</span></div>
-            <!-- 面试结论 / Offer 状态徽标，三个页面共用同一口径 -->
+            <!-- 面试结论 / Offer 状态 / 审批中徽标，三个页面共用同一口径 -->
             <div class="kbadge-row">
               <template v-if="a.interviews?.length">
                 <span v-for="iv in a.interviews" :key="iv.id" class="iv-badge" :class="iv.conclusion || iv.result">
@@ -272,22 +282,26 @@ function weightText(weights = {}) {
               <span v-if="a.offer" class="of-badge" :style="{ color: offerStatusMeta[a.offer.status][2], borderColor: offerStatusMeta[a.offer.status][2] }">
                 {{ offerStatusMeta[a.offer.status][0] }} Offer {{ offerStatusMeta[a.offer.status][1] }}
               </span>
+              <span v-for="t in ['stage_advance','interview_conclusion','offer_issue'].map(x => pendingTaskOf(a, x)).filter(Boolean)" :key="t.id" class="appr-badge" :title="`审批 #${t.id} 等待${t.chain[t.current_step]?.role === 'hiring_manager' ? '用人经理' : t.chain[t.current_step]?.role === 'recruiter' ? '招聘负责人' : '面试官'}处理`">
+                ⏳ {{ TASK_TYPE_LABEL[t.type] }}审批中
+              </span>
             </div>
             <div class="kfoot">
               <span class="muted">{{ a.city }}<template v-if="a.stage !== 'submitted'"> · v{{ a.version }}</template></span>
               <div class="ka">
                 <template v-if="nextStage(a.stage)">
-                  <button class="primary" :disabled="advanceGate(a).blocked || isBusy(a)"
-                    :title="advanceGate(a).msg || ''"
+                  <button class="primary" :disabled="advanceGate(a).blocked || isBusy(a) || !isRecruiter || !!pendingTaskOf(a, 'stage_advance')"
+                    :title="!isRecruiter ? '需切换为「招聘负责人」身份提请推进' : pendingTaskOf(a, 'stage_advance') ? '推进审批中，待用人经理处理' : advanceGate(a).msg || '提交推进审批（用人经理审批后生效）'"
                     @click="onAdvance(a)">
-                    {{ isBusy(a) ? '处理中…' : `→ ${nextStageLabel(a.stage)}` }}
+                    {{ pendingTaskOf(a, 'stage_advance') ? '⏳ 审批中' : isBusy(a) ? '处理中…' : `提请 → ${nextStageLabel(a.stage)}` }}
                   </button>
                 </template>
                 <span v-else-if="a.offer?.status === 'accepted'" class="succ-chip">✅ 已录用（待入职）</span>
                 <span v-else class="succ-chip">🎉 已入职</span>
-                <button class="danger" v-if="a.stage !== 'hired'" :disabled="isBusy(a)" @click="onReject(a)">淘汰</button>
-                <button class="warn" v-if="a.stage !== 'submitted'" :disabled="isBusy(a)"
-                  :title="a.stage === 'rejected' ? '复活回淘汰前阶段' : '回退到上一阶段（异常回退将留痕）'"
+                <button class="danger" v-if="a.stage !== 'hired'" :disabled="isBusy(a) || !isRecruiter"
+                  :title="isRecruiter ? '' : '需切换为「招聘负责人」身份'" @click="onReject(a)">淘汰</button>
+                <button class="warn" v-if="a.stage !== 'submitted'" :disabled="isBusy(a) || !isRecruiter"
+                  :title="!isRecruiter ? '需切换为「招聘负责人」身份' : a.stage === 'rejected' ? '复活回淘汰前阶段' : '回退到上一阶段（异常回退将留痕）'"
                   @click="onRollback(a)">↩ 回退</button>
               </div>
               <div class="gate-tip" v-if="nextStage(a.stage) && advanceGate(a).blocked">⚠️ {{ advanceGate(a).msg }}</div>
@@ -316,7 +330,7 @@ function weightText(weights = {}) {
           </div>
           <div class="rl-acts">
             <button class="trace-btn" @click="openTrace(a)">🔗 追溯</button>
-            <button class="warn" :disabled="isBusy(a)" @click="onRollback(a)">↩ 复活回退</button>
+            <button class="warn" :disabled="isBusy(a) || !isRecruiter" :title="isRecruiter ? '' : '需切换为「招聘负责人」身份'" @click="onRollback(a)">↩ 复活回退</button>
           </div>
         </div>
         <div class="muted empty-mini" v-if="!rejectedView.length">暂无淘汰记录。</div>
@@ -464,6 +478,7 @@ function weightText(weights = {}) {
 .iv-badge.fail { color: var(--red); border-color: rgba(255,107,122,.4); background: rgba(255,107,122,.08); }
 .iv-badge em { font-style: normal; opacity: .7; }
 .of-badge { font-size: 10px; border-radius: 9px; padding: 2px 7px; border: 1px solid; background: var(--panel2); }
+.appr-badge { font-size: 10px; border-radius: 9px; padding: 2px 7px; border: 1px solid rgba(255,209,102,.45); color: var(--accent2); background: rgba(255,209,102,.1); }
 .rejected-lane { padding: 0; overflow: hidden; }
 .rl-head { display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; cursor: pointer; user-select: none; }
 .rl-head b { font-size: 14px; display: flex; align-items: center; gap: 8px; }

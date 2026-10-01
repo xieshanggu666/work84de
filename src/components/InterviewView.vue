@@ -26,24 +26,41 @@ function lastInterview(a) {
 }
 function conclusionOf(iv) { return iv.conclusion || iv.result || 'pending' }
 
-// 仅评价文本/面试官变更，不打 toast
+// 仅评价文本/面试官变更，不打 toast（评价录入属日常协作，不纳入审批）
 function saveEval(iv) { store.setInterview(iv.id, { eval: iv.eval, interviewer: iv.interviewer }) }
-// 结论变更：服务端会联动阶段（fail→自动淘汰；淘汰态改判→复活）
+
+// ---- 角色权限与审批联动 ----
+// 面试结论（通过/不通过）由「面试官」提交审批，招聘负责人审批后生效并联动阶段；「待定」非终论可直接保存
+const isInterviewer = computed(() => store.myRole === 'interviewer')
+const isRecruiter = computed(() => store.myRole === 'recruiter')
+// 该面试是否存在进行中的结论审批
+function pendingConclusionTask(a, iv) {
+  const t = store.pendingTask(a.id, 'interview_conclusion')
+  return t && t.payload?.interview_id === iv.id ? t : null
+}
 function setConclusion(iv, c) {
   if (conclusionOf(iv) === c) return
-  store.setInterview(iv.id, { conclusion: c })
+  if (c === 'pending') { store.setInterview(iv.id, { conclusion: 'pending' }); return }
+  if (!isInterviewer.value) { store.notify('error', '面试结论需由「面试官」身份提交审批，请切换身份'); return }
+  store.submitApproval({
+    type: 'interview_conclusion',
+    application_id: detail.value.id,
+    payload: { interview_id: iv.id, conclusion: c }
+  })
 }
 const roundOpts = ['初试', '复试', '终面', 'HR面']
 function addRound() {
+  if (!isRecruiter.value) { store.notify('error', '安排面试需「招聘负责人」身份'); return }
   const used = new Set((detail.value.interviews || []).map(i => i.round))
   const round = roundOpts.find(r => !used.has(r)) || `第${(detail.value.interviews?.length || 0) + 1}轮`
   store.addInterview(detail.value.id, { round, interviewer: '', time: '待定' })
 }
-// 通过结论 + 协同推进到 Offer（推进接口再校验一次结论，双保险）
+// 结论已通过 → 提请推进到 Offer（招聘负责人提交，用人经理审批后回写阶段）
 function passAndAdvance(a) {
   const iv = lastInterview(a)
   if (!iv || conclusionOf(iv) !== 'pass') return
-  store.advance(a.id, a.version)
+  if (!isRecruiter.value) { store.notify('error', '提请推进需「招聘负责人」身份'); return }
+  store.submitApproval({ type: 'stage_advance', application_id: a.id, payload: { target_stage: 'offer' } })
 }
 </script>
 
@@ -88,28 +105,43 @@ function passAndAdvance(a) {
               <span class="rtag">{{ iv.round }}</span>
               <input v-model="iv.interviewer" placeholder="面试官姓名" @change="saveEval(iv)" />
               <div class="ivres">
-                <button class="succ" :class="{ on: conclusionOf(iv) === 'pass' }" @click="setConclusion(iv, 'pass')">✅ 通过</button>
-                <button class="danger" :class="{ on: conclusionOf(iv) === 'fail' }" @click="setConclusion(iv, 'fail')">❌ 不通过</button>
-                <button class="ghost" :class="{ on: conclusionOf(iv) === 'pending' }" @click="setConclusion(iv, 'pending')">⏳ 待定</button>
+                <button class="succ" :class="{ on: conclusionOf(iv) === 'pass' }"
+                  :disabled="!!pendingConclusionTask(detail, iv)"
+                  :title="isInterviewer ? '提交「通过」结论审批（招聘负责人审批后生效）' : '需「面试官」身份提交结论审批'"
+                  @click="setConclusion(iv, 'pass')">✅ 通过</button>
+                <button class="danger" :class="{ on: conclusionOf(iv) === 'fail' }"
+                  :disabled="!!pendingConclusionTask(detail, iv)"
+                  :title="isInterviewer ? '提交「不通过」结论审批（招聘负责人审批后生效）' : '需「面试官」身份提交结论审批'"
+                  @click="setConclusion(iv, 'fail')">❌ 不通过</button>
+                <button class="ghost" :class="{ on: conclusionOf(iv) === 'pending' }"
+                  :disabled="!!pendingConclusionTask(detail, iv)"
+                  title="「待定」非终论，直接保存无需审批"
+                  @click="setConclusion(iv, 'pending')">⏳ 待定</button>
               </div>
+            </div>
+            <div class="appr-pending" v-if="pendingConclusionTask(detail, iv)">
+              ⏳ 结论审批中（{{ pendingConclusionTask(detail, iv).payload?.conclusion === 'pass' ? '通过' : '不通过' }}），待招聘负责人审批 · #{{ pendingConclusionTask(detail, iv).id }}
             </div>
             <textarea v-model="iv.eval" placeholder="填写面试评价……" rows="2" @change="saveEval(iv)"></textarea>
             <div class="muted" v-if="iv.id === lastInterview(detail)?.id">
               {{ conclusionOf(iv) === 'fail'
                 ? '最近一轮结论为「不通过」：应聘已自动淘汰；如属误判，改回通过即可复活。'
                 : conclusionOf(iv) === 'pass'
-                  ? '最近一轮结论为「通过」：可直接推进到 Offer 阶段。'
-                  : '这是最后一轮评价，给出「通过」结论后才能推进候选人到 Offer。' }}
+                  ? '最近一轮结论为「通过」：可提请推进到 Offer 阶段（用人经理审批）。'
+                  : '这是最后一轮评价，「通过/不通过」结论需提交审批，由招聘负责人审批后生效。' }}
             </div>
           </div>
         </div>
         <div class="acts">
-          <button class="primary" @click="addRound">＋ 添加下一轮面试</button>
-          <button class="succ" :disabled="detail.stage !== 'interview' || conclusionOf(lastInterview(detail)) !== 'pass'"
-            @click="passAndAdvance(detail)">→ 通过并推进到 Offer</button>
+          <button class="primary" :disabled="!isRecruiter" :title="isRecruiter ? '' : '需「招聘负责人」身份安排面试'" @click="addRound">＋ 添加下一轮面试</button>
+          <button class="succ" :disabled="detail.stage !== 'interview' || conclusionOf(lastInterview(detail)) !== 'pass' || !isRecruiter || !!store.pendingTask(detail.id, 'stage_advance')"
+            :title="!isRecruiter ? '需「招聘负责人」身份提请推进' : store.pendingTask(detail.id, 'stage_advance') ? '推进审批中' : '提交推进审批（用人经理审批后进入 Offer）'"
+            @click="passAndAdvance(detail)">
+            {{ store.pendingTask(detail.id, 'stage_advance') ? '⏳ 推进审批中' : '→ 提请推进到 Offer' }}
+          </button>
           <button class="ghost" @click="detail = null">关闭</button>
         </div>
-        <div class="muted tip">面试结论是进入 Offer 的硬约束；结论变更与阶段联动、阶段快照在同一事务提交。</div>
+        <div class="muted tip">面试结论是进入 Offer 的硬约束；结论经审批生效后与阶段联动、阶段快照在同一事务提交。</div>
       </div>
     </div>
   </div>
@@ -140,6 +172,7 @@ function passAndAdvance(a) {
 .ivres button.on.succ { background: var(--green); color: #06231a; }
 .ivres button.on.danger { background: var(--red); color: #fff; }
 .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.appr-pending { font-size: 11px; color: var(--accent2); background: rgba(255,209,102,.1); border: 1px solid rgba(255,209,102,.35); border-radius: 8px; padding: 5px 9px; margin-bottom: 8px; }
 .tip { margin-top: 10px; font-size: 12px; }
 textarea { width: 100%; background: #101731; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; }
 </style>

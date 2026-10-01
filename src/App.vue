@@ -8,10 +8,12 @@ import MatchView from '@/components/MatchView.vue'
 import PipelineView from '@/components/PipelineView.vue'
 import InterviewView from '@/components/InterviewView.vue'
 import OfferView from '@/components/OfferView.vue'
+import ApprovalView from '@/components/ApprovalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 
 const store = useHrStore()
 const view = ref('overview')
+const showNotify = ref(false)
 
 const navs = [
   { k: 'overview', icon: '📊', label: '招聘总览' },
@@ -21,8 +23,32 @@ const navs = [
   { k: 'pipeline', icon: '🔄', label: '招聘流程' },
   { k: 'interview', icon: '💬', label: '面试管理' },
   { k: 'offer', icon: '📄', label: 'Offer 管理' },
+  { k: 'approval', icon: '✅', label: '审批中心' },
   { k: 'reports', icon: '📈', label: '报表中心' }
 ]
+
+const roleIcon = { recruiter: '🧭', interviewer: '💬', hiring_manager: '🏢' }
+const notifyIcon = {
+  task_submitted: '📨', task_approved: '✅', task_returned: '↩️', task_resubmitted: '🔁',
+  task_executed: '🎉', task_failed: '⚠️', task_cancelled: '🚫'
+}
+
+function onSwitchUser(e) {
+  store.setUser(e.target.value)
+  showNotify.value = false
+  store.refresh()
+}
+function toggleNotify() {
+  showNotify.value = !showNotify.value
+}
+function readAll() {
+  store.markNotificationsRead()
+}
+// 点击通知跳转到审批中心并关闭面板
+function openNotify() {
+  showNotify.value = false
+  view.value = 'approval'
+}
 
 onMounted(store.refresh)
 </script>
@@ -37,6 +63,7 @@ onMounted(store.refresh)
       <nav>
         <button v-for="n in navs" :key="n.k" class="navitem" :class="{ on: view === n.k }" @click="view = n.k">
           <span>{{ n.icon }}</span>{{ n.label }}
+          <em v-if="n.k === 'approval' && store.todoCount" class="nav-badge">{{ store.todoCount }}</em>
         </button>
       </nav>
       <div class="mini card">
@@ -54,8 +81,40 @@ onMounted(store.refresh)
           <span class="pill">👥 候选人 <b>{{ store.candidates.length }}</b></span>
           <span class="pill">🎉 已入职 <b>{{ store.offers.filter(o => o.status === 'joined').length }}</b></span>
         </div>
+        <div class="idzone">
+          <!-- 身份切换：演示环境模拟登录，角色决定可见操作与审批权限 -->
+          <label class="idchip" :title="`当前身份：${store.currentUser?.title || ''}`">
+            <span>{{ roleIcon[store.myRole] || '👤' }}</span>
+            <select :value="store.userId" @change="onSwitchUser">
+              <option v-for="u in store.users" :key="u.id" :value="u.id">{{ u.name }} · {{ u.title }}</option>
+            </select>
+          </label>
+          <!-- 审计通知铃铛 -->
+          <div class="bell-wrap">
+            <button class="bell" :class="{ on: showNotify }" @click="toggleNotify" title="审计通知">
+              🔔<em v-if="store.unreadCount" class="bell-badge">{{ store.unreadCount > 99 ? '99+' : store.unreadCount }}</em>
+            </button>
+            <div class="notify-panel card" v-if="showNotify">
+              <div class="np-head">
+                <b>🔔 审计通知</b>
+                <button class="ghost sm" :disabled="!store.unreadCount" @click="readAll">全部已读</button>
+              </div>
+              <div class="np-list">
+                <div class="np-item" v-for="n in store.myNotifications.slice(0, 30)" :key="n.id" :class="{ unread: !n.is_read }" @click="openNotify">
+                  <span class="np-icon">{{ notifyIcon[n.type] || '📌' }}</span>
+                  <div class="np-body">
+                    <b>{{ n.title }}</b>
+                    <p>{{ n.body }}</p>
+                    <em class="muted">{{ n.created_at }}</em>
+                  </div>
+                </div>
+                <div class="empty" v-if="!store.myNotifications.length">暂无通知。</div>
+              </div>
+            </div>
+          </div>
+        </div>
       </header>
-      <section class="views">
+      <section class="views" @click="showNotify = false">
         <OverviewView v-if="view === 'overview'" />
         <PositionsView v-else-if="view === 'positions'" />
         <CandidatesView v-else-if="view === 'candidates'" />
@@ -63,6 +122,7 @@ onMounted(store.refresh)
         <PipelineView v-else-if="view === 'pipeline'" />
         <InterviewView v-else-if="view === 'interview'" />
         <OfferView v-else-if="view === 'offer'" />
+        <ApprovalView v-else-if="view === 'approval'" />
         <ReportsView v-else />
       </section>
     </main>
@@ -95,6 +155,26 @@ main { flex: 1; min-width: 0; }
 .pills { display: flex; gap: 10px; }
 .pill { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); padding: 6px 12px; border-radius: 20px; }
 .pill b { color: var(--text); }
+.nav-badge { margin-left: auto; font-style: normal; font-size: 10px; min-width: 17px; height: 17px; border-radius: 9px; background: var(--red); color: #fff; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; }
+.idzone { display: flex; align-items: center; gap: 10px; }
+.idchip { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 6px 4px 12px; font-size: 13px; }
+.idchip select { border: none; background: transparent; padding: 3px 4px; font-size: 13px; }
+.bell-wrap { position: relative; }
+.bell { position: relative; width: 36px; height: 36px; border-radius: 50%; padding: 0; font-size: 16px; display: flex; align-items: center; justify-content: center; }
+.bell.on { border-color: var(--accent); background: rgba(91,140,255,.15); }
+.bell-badge { position: absolute; top: -5px; right: -7px; font-style: normal; font-size: 10px; min-width: 17px; height: 17px; border-radius: 9px; background: var(--red); color: #fff; display: flex; align-items: center; justify-content: center; padding: 0 4px; }
+.notify-panel { position: absolute; right: 0; top: 44px; width: 360px; max-height: 480px; z-index: 80; padding: 12px; display: flex; flex-direction: column; gap: 8px; box-shadow: var(--shadow); }
+.np-head { display: flex; justify-content: space-between; align-items: center; }
+.np-head button { font-size: 11px; padding: 3px 8px; }
+.np-list { overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.np-item { display: flex; gap: 9px; padding: 9px 10px; border-radius: 9px; background: var(--panel2); border: 1px solid var(--border); cursor: pointer; font-size: 12px; }
+.np-item:hover { border-color: var(--accent); }
+.np-item.unread { border-left: 3px solid var(--accent); }
+.np-icon { font-size: 15px; }
+.np-body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.np-body b { font-size: 12.5px; }
+.np-body p { color: var(--muted); font-size: 11.5px; line-height: 1.45; word-break: break-all; }
+.np-body em { font-style: normal; font-size: 10.5px; }
 .toast { position: fixed; right: 22px; bottom: 22px; z-index: 100; padding: 11px 16px; border-radius: 10px; font-size: 13px;
   background: rgba(19,25,44,.96); border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,.4);
   display: flex; align-items: center; gap: 8px; max-width: 380px; }

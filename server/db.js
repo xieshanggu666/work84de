@@ -182,6 +182,65 @@ CREATE TABLE IF NOT EXISTS channels (
   name TEXT NOT NULL,
   cost INTEGER NOT NULL DEFAULT 0
 );
+
+-- 平台用户与角色：recruiter 招聘负责人 / interviewer 面试官 / hiring_manager 用人经理
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT ''
+);
+
+-- 审批任务：候选人推进 / 面试结论 / Offer 发放三类关键动作的前置闸门
+-- 审批链在提交时固化为 JSON（含动态加签节点），任务推进只移动 current_step 指针
+CREATE TABLE IF NOT EXISTS approval_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,                 -- stage_advance/interview_conclusion/offer_issue
+  application_id INTEGER NOT NULL,
+  interview_id INTEGER NOT NULL DEFAULT 0,
+  offer_id INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL DEFAULT '{}', -- 申请内容快照（目标阶段/结论/薪资等，重提时整体替换）
+  chain TEXT NOT NULL DEFAULT '[]',   -- [{role,reason?}] 提交时固化的审批链
+  current_step INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/returned/cancelled/failed
+  submitted_by TEXT NOT NULL DEFAULT '',
+  submitted_by_name TEXT NOT NULL DEFAULT '',
+  submitted_role TEXT NOT NULL DEFAULT '',
+  submitted_at TEXT NOT NULL DEFAULT '',
+  decided_at TEXT NOT NULL DEFAULT '',
+  decide_note TEXT NOT NULL DEFAULT '',
+  result_note TEXT NOT NULL DEFAULT '',   -- 终审执行结果/失败原因（业务状态漂移导致）
+  version INTEGER NOT NULL DEFAULT 1      -- 乐观锁：防两人同时审批同一任务
+);
+CREATE INDEX IF NOT EXISTS idx_approval_tasks_app ON approval_tasks(application_id, status);
+
+-- 审批步骤留痕：提交/逐级通过/退回/重提/撤销/执行回写，只追加不改写（审计证据链）
+CREATE TABLE IF NOT EXISTS approval_steps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  step_no INTEGER NOT NULL DEFAULT -1,  -- -1=申请人动作；>=0=审批链节点序号
+  role TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT '',      -- submit/approve/return/resubmit/cancel/execute/failed
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  acted_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_approval_steps_task ON approval_steps(task_id, id);
+
+-- 审计通知：任务提交/通过/退回/重提/生效/失败按角色投递，接收人角色可标记已读
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient_role TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT '',        -- task_submitted/task_approved/task_returned/task_resubmitted/task_executed/task_failed/task_cancelled
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  task_id INTEGER NOT NULL DEFAULT 0,
+  application_id INTEGER NOT NULL DEFAULT 0,
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, is_read, id);
 `)
 
 // ---------------- 兼容已有库：补列迁移 ----------------
@@ -289,6 +348,19 @@ function seed() {
   ;[['内推', 0], ['Boss直聘', 6000], ['猎头', 20000], ['校招', 8000], ['站酷', 4000]].forEach(ch => iCh.run(...ch))
 }
 seed()
+
+// 内置三类角色用户：招聘负责人 / 面试官 / 用人经理（演示环境固定账号，前端顶栏可切换身份）
+function seedUsers() {
+  const n = db.prepare('SELECT COUNT(*) c FROM users').get().c
+  if (n > 0) return
+  const iU = db.prepare('INSERT INTO users(id,name,role,title) VALUES(?,?,?,?)')
+  ;[
+    ['u-sandy', 'Sandy 陈', 'recruiter', '招聘负责人'],
+    ['u-li', '李工', 'interviewer', '面试官'],
+    ['u-wang', '王经理', 'hiring_manager', '用人经理']
+  ].forEach(u => iU.run(...u))
+}
+seedUsers()
 
 export default db
 export { now, ts, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP }

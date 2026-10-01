@@ -1,8 +1,10 @@
 import { defineStore } from 'pinia'
 
 const BASE = '/api'
+// 当前登录身份（演示环境顶栏切换，持久化到 localStorage）；每次请求携带供服务端做角色权限校验
+let currentUserId = localStorage.getItem('hr-user-id') || 'u-sandy'
 async function j(method, path, body) {
-  const opt = { method, headers: { 'Content-Type': 'application/json' } }
+  const opt = { method, headers: { 'Content-Type': 'application/json', 'x-user-id': currentUserId } }
   if (body !== undefined) opt.body = JSON.stringify(body)
   let r
   try {
@@ -19,6 +21,7 @@ export const useHrStore = defineStore('hr', {
   state: () => ({
     data: null,
     loaded: false,
+    userId: currentUserId,
     // 全局轻提示：服务端 4xx 约束（重复操作/状态冲突/乐观锁）统一在此提示，保证各页面口径一致
     toast: null,
     // 进行中的操作键（如 advance:3）：按钮置灰，防止重复点击/并发提交
@@ -36,9 +39,28 @@ export const useHrStore = defineStore('hr', {
     strategyVersions: s => s.data?.strategyVersions || [],
     recalcJobs: s => s.data?.recalcJobs || [],
     recalcItems: s => s.data?.recalcItems || [],
+    users: s => s.data?.users || [],
+    approvals: s => s.data?.approvals || [],
+    notifications: s => s.data?.notifications || [],
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
-    isBusy: s => key => !!s.pending[key]
+    isBusy: s => key => !!s.pending[key],
+    // 当前身份与角色能力：关键动作（提请推进/给结论/发起 Offer/审批）按角色在 UI 层前置拦截
+    currentUser(s) { return (s.data?.users || []).find(u => u.id === s.userId) || null },
+    myRole() { return this.currentUser?.role || 'recruiter' },
+    myNotifications() {
+      return this.notifications.filter(n => n.recipient_role === this.myRole)
+    },
+    unreadCount() { return this.myNotifications.filter(n => !n.is_read).length },
+    // 某应聘是否存在进行中的审批（可选指定类型）：看板/面试/Offer 页用来显示「审批中」并禁止重复提请
+    pendingTask: s => (appId, type) =>
+      (s.data?.approvals || []).find(t => t.application_id === appId && t.status === 'pending' && (!type || t.type === type)) || null,
+    // 待当前角色审批的任务数（审批中心红点）
+    todoCount() {
+      return this.approvals.filter(t =>
+        t.status === 'pending' && t.chain[t.current_step]?.role === this.myRole
+      ).length
+    }
   },
   actions: {
     notify(type, msg) {
@@ -137,6 +159,37 @@ export const useHrStore = defineStore('hr', {
     setOffer(ofId, status, version) {
       const msg = { accepted: '候选人已接受 Offer', rejected: 'Offer 已拒绝', joined: '已确认入职', withdrawn: 'Offer 已撤回' }[status]
       return this.updateOffer(ofId, { status, version }, msg)
+    },
+    // ---------------- 身份与审批 ----------------
+    setUser(id) {
+      this.userId = id
+      currentUserId = id
+      localStorage.setItem('hr-user-id', id)
+    },
+    // 提交审批申请（候选人推进/面试结论/Offer 发放）
+    submitApproval(payload) {
+      return this.runBusy(`appr-new:${payload.type}:${payload.application_id}`, () =>
+        this.api('POST', '/approvals', payload, { success: '审批申请已提交，待审批人处理' }))
+    },
+    // 审批决定：approve 通过 / return 退回（退回必须带意见）
+    decideApproval(id, payload, successMsg) {
+      return this.runBusy(`appr:${id}`, async () => {
+        const r = await this.api('POST', `/approvals/${id}/decide`, payload, successMsg ? { success: successMsg } : {})
+        // 终审通过但业务回写失败（流程状态漂移）：接口仍返回 ok，这里把失败原因提示出来
+        if (r?.status === 'failed') this.notify('error', `审批已通过但执行失败：${r.msg}`)
+        return r
+      })
+    },
+    resubmitApproval(id, payload) {
+      return this.runBusy(`appr:${id}`, () =>
+        this.api('POST', `/approvals/${id}/resubmit`, { payload }, { success: '已修改并重新提交审批' }))
+    },
+    cancelApproval(id) {
+      return this.runBusy(`appr:${id}`, () =>
+        this.api('POST', `/approvals/${id}/cancel`, {}, { success: '申请已撤销' }))
+    },
+    markNotificationsRead(ids) {
+      return this.api('POST', '/notifications/read', ids?.length ? { ids } : {})
     }
   }
 })
